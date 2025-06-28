@@ -1,8 +1,4 @@
 from flask import Flask
-
-app = Flask(__name__)
-
-import os
 import requests
 import pdfplumber
 import re
@@ -11,34 +7,28 @@ import time
 import traceback
 from collections import defaultdict
 from geopy.geocoders import ArcGIS
+import io
+
+app = Flask(__name__)
 
 PDF_URL = "https://www.nyc.gov/html/dot/downloads/pdf/concretesch.pdf"
-PDF_FILE = "concretesch.pdf"
 NYC_CENTRE = [40.7128, -74.0060]
-OUT_HTML = "NYC_concrete_repairs_latest.html"
 
-def download_latest_pdf(url, filename):
-    print("Downloading latest schedule PDF...")
+def download_latest_pdf():
     try:
-        r = requests.get(url, stream=True, timeout=30)
-        print(f"HTTP status: {r.status_code}")
+        r = requests.get(PDF_URL, stream=True, timeout=30)
         if r.status_code == 200:
-            with open(filename, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            print(f"Downloaded {filename}")
-            return True
+            return io.BytesIO(r.content)
         else:
             print("Failed to download PDF. Status code:", r.status_code)
-            return False
     except Exception as e:
         print("Exception during PDF download:", e)
-        return False
+    return None
 
-def extract_rows(pdf_path):
+def extract_rows(pdf_filelike):
     boro_tokens = ["Bronx", "Brooklyn", "Manhattan", "Queens", "STATEN"]
     rows, boro = [], None
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(pdf_filelike) as pdf:
         for page in pdf.pages:
             for raw in page.extract_text().splitlines():
                 ln = raw.strip()
@@ -52,7 +42,6 @@ def extract_rows(pdf_path):
                 if not ln.endswith("Concrete"):
                     continue
                 rows.append((boro, ln[:-8].strip()))
-    print(f"Extracted {len(rows)} segments from PDF.")
     return rows
 
 def split_streets(block):
@@ -76,8 +65,12 @@ def split_streets(block):
         streets.append("")
     return streets[:3]
 
-def make_map(pdf_path):
-    rows = extract_rows(pdf_path)
+def generate_map():
+    pdf_filelike = download_latest_pdf()
+    if not pdf_filelike:
+        return None
+
+    rows = extract_rows(pdf_filelike)
     borough_colours = defaultdict(
         lambda: "gray",
         {
@@ -88,14 +81,12 @@ def make_map(pdf_path):
             "Staten Island": "purple"
         }
     )
-    geocoder = ArcGIS(timeout=10)
     m = folium.Map(location=NYC_CENTRE, zoom_start=11, tiles="CartoDB positron")
-
+    geocoder = ArcGIS(timeout=10)
     for idx, (boro, block) in enumerate(rows):
         on_st, from_st, to_st = split_streets(block)
         if not (on_st and from_st):
             continue
-
         # Geocode start (On Street & From Street)
         start_addr = f"{on_st} & {from_st}, {boro}, NY"
         start_location = None
@@ -107,9 +98,7 @@ def make_map(pdf_path):
                 time.sleep(1)
             tries += 1
         if not start_location:
-            print(f"Could not geocode start: {start_addr}")
             continue
-
         # Geocode end (On Street & To Street), if To Street exists
         end_location = None
         if to_st:
@@ -121,7 +110,6 @@ def make_map(pdf_path):
                 except Exception:
                     time.sleep(1)
                 tries += 1
-
         # Draw line if both endpoints exist, otherwise just mark the start
         if end_location:
             folium.PolyLine(
@@ -131,7 +119,7 @@ def make_map(pdf_path):
                 ],
                 color=borough_colours[boro],
                 weight=6,
-                opacity=0.35,  # More translucent
+                opacity=0.35,
                 popup=f"{boro}: {on_st} from {from_st} to {to_st}"
             ).add_to(m)
             folium.CircleMarker(
@@ -158,21 +146,16 @@ def make_map(pdf_path):
                 popup=f"{boro}: {on_st} at {from_st} (no end point found)",
                 icon=folium.Icon(color=borough_colours[boro])
             ).add_to(m)
-        if idx % 20 == 0:
-            print(f"Processed {idx+1} of {len(rows)} locations...")
+    return m
 
-    m.save(OUT_HTML)
-    print(f"Map saved ➜ {OUT_HTML}")
-
-if __name__ == "__main__":
+@app.route('/')
+def home():
     try:
-        print("Script started.")
-        if download_latest_pdf(PDF_URL, PDF_FILE):
-            print("PDF downloaded, now making map...")
-            make_map(PDF_FILE)
-        else:
-            print("Failed to download PDF.")
-        print("Script finished.")
+        m = generate_map()
+        if m is None:
+            return "Failed to generate map. Please try again later."
+        return m.get_root().render()
     except Exception as e:
-        print("An error occurred!")
         traceback.print_exc()
+        return f"An error occurred: {str(e)}"
+
