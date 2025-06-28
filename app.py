@@ -1,4 +1,5 @@
-from flask import Flask
+from flask import Flask, send_file
+from flask_apscheduler import APScheduler
 import requests
 import pdfplumber
 import re
@@ -8,11 +9,22 @@ import traceback
 from collections import defaultdict
 from geopy.geocoders import ArcGIS
 import io
-
-app = Flask(__name__)
+import os
 
 PDF_URL = "https://www.nyc.gov/html/dot/downloads/pdf/concretesch.pdf"
 NYC_CENTRE = [40.7128, -74.0060]
+MAP_FILE = "latest_map.html"
+
+app = Flask(__name__)
+
+class Config:
+    SCHEDULER_API_ENABLED = True
+
+app.config.from_object(Config())
+
+scheduler = APScheduler()
+scheduler.init_app(app)
+scheduler.start()
 
 def download_latest_pdf():
     try:
@@ -65,97 +77,111 @@ def split_streets(block):
         streets.append("")
     return streets[:3]
 
-def generate_map():
-    pdf_filelike = download_latest_pdf()
-    if not pdf_filelike:
-        return None
+def generate_and_save_map():
+    try:
+        print("Generating new map...")
+        pdf_filelike = download_latest_pdf()
+        if not pdf_filelike:
+            print("No PDF downloaded, skipping map generation.")
+            return
 
-    rows = extract_rows(pdf_filelike)
-    borough_colours = defaultdict(
-        lambda: "gray",
-        {
-            "Bronx": "red",
-            "Brooklyn": "blue",
-            "Manhattan": "green",
-            "Queens": "orange",
-            "Staten Island": "purple"
-        }
-    )
-    m = folium.Map(location=NYC_CENTRE, zoom_start=11, tiles="CartoDB positron")
-    geocoder = ArcGIS(timeout=10)
-    for idx, (boro, block) in enumerate(rows):
-        on_st, from_st, to_st = split_streets(block)
-        if not (on_st and from_st):
-            continue
-        # Geocode start (On Street & From Street)
-        start_addr = f"{on_st} & {from_st}, {boro}, NY"
-        start_location = None
-        tries = 0
-        while start_location is None and tries < 3:
-            try:
-                start_location = geocoder.geocode(start_addr)
-            except Exception:
-                time.sleep(1)
-            tries += 1
-        if not start_location:
-            continue
-        # Geocode end (On Street & To Street), if To Street exists
-        end_location = None
-        if to_st:
-            end_addr = f"{on_st} & {to_st}, {boro}, NY"
+        rows = extract_rows(pdf_filelike)
+        borough_colours = defaultdict(
+            lambda: "gray",
+            {
+                "Bronx": "red",
+                "Brooklyn": "blue",
+                "Manhattan": "green",
+                "Queens": "orange",
+                "Staten Island": "purple"
+            }
+        )
+        m = folium.Map(location=NYC_CENTRE, zoom_start=11, tiles="CartoDB positron")
+        geocoder = ArcGIS(timeout=10)
+        for idx, (boro, block) in enumerate(rows):
+            on_st, from_st, to_st = split_streets(block)
+            if not (on_st and from_st):
+                continue
+            # Geocode start (On Street & From Street)
+            start_addr = f"{on_st} & {from_st}, {boro}, NY"
+            start_location = None
             tries = 0
-            while end_location is None and tries < 3:
+            while start_location is None and tries < 3:
                 try:
-                    end_location = geocoder.geocode(end_addr)
+                    start_location = geocoder.geocode(start_addr)
                 except Exception:
                     time.sleep(1)
                 tries += 1
-        # Draw line if both endpoints exist, otherwise just mark the start
-        if end_location:
-            folium.PolyLine(
-                locations=[
-                    [start_location.latitude, start_location.longitude],
-                    [end_location.latitude, end_location.longitude]
-                ],
-                color=borough_colours[boro],
-                weight=6,
-                opacity=0.35,
-                popup=f"{boro}: {on_st} from {from_st} to {to_st}"
-            ).add_to(m)
-            folium.CircleMarker(
-                location=[start_location.latitude, start_location.longitude],
-                radius=4,
-                color=borough_colours[boro],
-                fill=True,
-                fill_color=borough_colours[boro],
-                fill_opacity=0.9,
-                popup=f"START: {on_st} & {from_st}"
-            ).add_to(m)
-            folium.CircleMarker(
-                location=[end_location.latitude, end_location.longitude],
-                radius=4,
-                color=borough_colours[boro],
-                fill=True,
-                fill_color=borough_colours[boro],
-                fill_opacity=0.9,
-                popup=f"END: {on_st} & {to_st}"
-            ).add_to(m)
-        else:
-            folium.Marker(
-                location=[start_location.latitude, start_location.longitude],
-                popup=f"{boro}: {on_st} at {from_st} (no end point found)",
-                icon=folium.Icon(color=borough_colours[boro])
-            ).add_to(m)
-    return m
+            if not start_location:
+                continue
+            # Geocode end (On Street & To Street), if To Street exists
+            end_location = None
+            if to_st:
+                end_addr = f"{on_st} & {to_st}, {boro}, NY"
+                tries = 0
+                while end_location is None and tries < 3:
+                    try:
+                        end_location = geocoder.geocode(end_addr)
+                    except Exception:
+                        time.sleep(1)
+                    tries += 1
+            # Draw line if both endpoints exist, otherwise just mark the start
+            if end_location:
+                folium.PolyLine(
+                    locations=[
+                        [start_location.latitude, start_location.longitude],
+                        [end_location.latitude, end_location.longitude]
+                    ],
+                    color=borough_colours[boro],
+                    weight=6,
+                    opacity=0.35,
+                    popup=f"{boro}: {on_st} from {from_st} to {to_st}"
+                ).add_to(m)
+                folium.CircleMarker(
+                    location=[start_location.latitude, start_location.longitude],
+                    radius=4,
+                    color=borough_colours[boro],
+                    fill=True,
+                    fill_color=borough_colours[boro],
+                    fill_opacity=0.9,
+                    popup=f"START: {on_st} & {from_st}"
+                ).add_to(m)
+                folium.CircleMarker(
+                    location=[end_location.latitude, end_location.longitude],
+                    radius=4,
+                    color=borough_colours[boro],
+                    fill=True,
+                    fill_color=borough_colours[boro],
+                    fill_opacity=0.9,
+                    popup=f"END: {on_st} & {to_st}"
+                ).add_to(m)
+            else:
+                folium.Marker(
+                    location=[start_location.latitude, start_location.longitude],
+                    popup=f"{boro}: {on_st} at {from_st} (no end point found)",
+                    icon=folium.Icon(color=borough_colours[boro])
+                ).add_to(m)
+        # Save the map as an HTML file
+        m.save(MAP_FILE)
+        print("Map saved!")
+    except Exception as e:
+        print("Error generating map:")
+        traceback.print_exc()
+
+# Schedule the job to run every hour
+@scheduler.task('interval', id='generate_map_job', hours=1, misfire_grace_time=900)
+def scheduled_map_job():
+    generate_and_save_map()
+
+# Also generate the map at startup
+generate_and_save_map()
 
 @app.route('/')
-def home():
-    try:
-        m = generate_map()
-        if m is None:
-            return "Failed to generate map. Please try again later."
-        return m.get_root().render()
-    except Exception as e:
-        traceback.print_exc()
-        return f"An error occurred: {str(e)}"
+def serve_map():
+    if os.path.exists(MAP_FILE):
+        return send_file(MAP_FILE)
+    else:
+        return "Map is not ready yet. Please check back soon."
 
+if __name__ == '__main__':
+    app.run(debug=True)
